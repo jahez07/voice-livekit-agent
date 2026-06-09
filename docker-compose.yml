@@ -1,0 +1,69 @@
+services:
+  livekit-server:
+    image: livekit/livekit-server
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882-7892:7882-7892/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml
+    command: --config /etc/livekit.yaml
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "5001:5001"
+    env_file:
+      - .env
+    environment:
+      - LIVEKIT_URL=ws://livekit-server:7880
+    depends_on:
+      - livekit-server
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    env_file:
+      - .env
+    environment:
+      - LIVEKIT_URL=ws://livekit-server:7880
+    depends_on:
+      - livekit-server
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  sip:
+    image: livekit/sip
+    network_mode: host
+    depends_on:
+      - livekit-server
+      - redis
+    environment:
+      SIP_CONFIG_BODY: |
+        api_key: APIuoFDt5njRYLA
+        api_secret: MooeqeW9ae5QvvlgjFFGbuFkzA7160g9e5mSVPfAbEIH
+        ws_url: ws://host.docker.internal:7880
+        redis:
+          address: host.docker.internal:6379
+        sip_port: 5060
+        rtp_port: 10000-20000
+        use_external_ip: true
+        logging:
+          level: debug
+
+volumes:
+  redis_data:

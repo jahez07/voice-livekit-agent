@@ -41,11 +41,7 @@ def get_token():
         )
     )
 
-    return jsonify(
-        {
-            "token": token.to_jwt(), "url": os.getenv("LIVEKIT_URL")
-        }
-    )
+    return jsonify({"token": token.to_jwt(), "url": os.getenv("LIVEKIT_URL")})
 
 
 # Twilio webhook (for inbound phone calls)
@@ -62,12 +58,12 @@ def incoming_call():
                 room_name=f"call-{call_sid}",
                 participant_identity=from_number,
                 participant_name=from_number,
-                agents=[RoomAgentDispatch(agent_name="my-agent")]
+                agents=[RoomAgentDispatch(agent_name="my-agent")],
             )
         )
         await lkapi.aclose()
         return response.connect_url
-    
+
     connect_url = loop.run_until_complete(get_connect_url)
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -77,7 +73,6 @@ def incoming_call():
         <Stream url="{connect_url}" />
     </Connect>
 </Response>"""
-    
 
     return Response(twiml, mimetype="application/xml")
 

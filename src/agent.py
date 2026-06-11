@@ -11,7 +11,7 @@ from livekit.agents import (
     cli,
     room_io,
 )
-from livekit.plugins import silero, openai, cartesia, noise_cancellation
+from livekit.plugins import cartesia, noise_cancellation, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
@@ -78,12 +78,10 @@ async def my_agent(ctx: JobContext):
     }
 
     session = AgentSession(
-        stt= openai.STT(
+        stt=openai.STT(
             model="gpt-4o-mini-transcribe",
         ),
-        tts=cartesia.TTS(
-            model="sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
-        ),
+        tts=cartesia.TTS(model="sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
@@ -96,7 +94,7 @@ async def my_agent(ctx: JobContext):
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=noise_cancellation.BVC
             )
-        )
+        ),
     )
 
     await ctx.connect()

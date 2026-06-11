@@ -1,4 +1,5 @@
 import asyncio
+
 from livekit import api
 
 
@@ -44,23 +45,17 @@ async def setup_sip():
         allowed_addresses=["192.168.2.185"],
         numbers=["245"],
     )
-    await lk.sip.create_sip_inbound_trunk(
-        api.CreateSIPInboundTrunkRequest(trunk=trunk)
-    )
+    await lk.sip.create_sip_inbound_trunk(api.CreateSIPInboundTrunkRequest(trunk=trunk))
     print("✅ Inbound trunk created")
 
     # Create dispatch rule
     rule = api.SIPDispatchRuleInfo(
         name="Agent-Dispatch",
         rule=api.SIPDispatchRule(
-            dispatch_rule_individual=api.SIPDispatchRuleIndividual(
-                room_prefix="call-"
-            )
+            dispatch_rule_individual=api.SIPDispatchRuleIndividual(room_prefix="call-")
         ),
     )
-    await lk.sip.create_sip_dispatch_rule(
-        api.CreateSIPDispatchRuleRequest(rule=rule)
-    )
+    await lk.sip.create_sip_dispatch_rule(api.CreateSIPDispatchRuleRequest(rule=rule))
     print("✅ Dispatch rule created")
 
     await lk.aclose()

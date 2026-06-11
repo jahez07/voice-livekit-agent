@@ -10,8 +10,11 @@ from livekit.agents import (
     JobProcess,
     cli,
     room_io,
+    UserInputTranscribedEvent,
+    ConversationItemAddedEvent
 )
-from livekit.plugins import cartesia, noise_cancellation, openai, silero
+from livekit.agents.llm import ChatMessage
+from livekit.plugins import cartesia, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
@@ -87,12 +90,29 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
+    # @session.on("user_input_transcribed")
+    # def on_user_input_transcribed(event: UserInputTranscribedEvent):
+    #     print(f"User input transcribed: {event.transcript},"
+    #           f"language: {event.language},"
+    #           f"speaker id: {event.speaker_id}")
+        
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(event: ConversationItemAddedEvent):
+        if not isinstance(event.item,ChatMessage):
+            return
+        print(f"Conversation item added from {event.item.role}. interrupted: {event.item.interrupted}")
+
+        for content in event.item.content:
+            if isinstance(content, str):
+                print(f"   - text: {content}")
+
     await session.start(
         agent=Assistant(),
         room=ctx.room,
         room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=noise_cancellation.BVC
+            text_output=room_io.TextOutputOptions(
+                json_format=True,
+                sync_transcription=True,
             )
         ),
     )

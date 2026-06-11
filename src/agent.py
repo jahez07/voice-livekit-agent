@@ -11,7 +11,7 @@ from livekit.agents import (
     cli,
     room_io,
 )
-from livekit.plugins import silero, openai, cartesia, deepgram
+from livekit.plugins import silero, openai, cartesia, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
@@ -92,7 +92,11 @@ async def my_agent(ctx: JobContext):
     await session.start(
         agent=Assistant(),
         room=ctx.room,
-        # Removed ai_coustics noise cancellation (cloud-only)
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=noise_cancellation.BVC
+            )
+        )
     )
 
     await ctx.connect()

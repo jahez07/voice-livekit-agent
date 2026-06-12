@@ -86,8 +86,10 @@ async def my_agent(ctx: JobContext):
         stt=openai.STT(
             model="gpt-4o-mini-transcribe",
         ),
-        #tts=cartesia.TTS(model="sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
-        tts=elevenlabs.TTS(model="eleven_flash_v2_5", voice_id="Xb7hH8MSUJpSbSDYk0k2"),
+        # French : Pauline: 65b25c5d-ff07-4687-a04c-da2f43ef6fa9
+        # English : 9626c31c-bec5-4cca-baa8-f8ba9e84c8bc
+        tts=cartesia.TTS(model="sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+        #tts=elevenlabs.TTS(model="eleven_flash_v2_5", voice_id="Xb7hH8MSUJpSbSDYk0k2"),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,

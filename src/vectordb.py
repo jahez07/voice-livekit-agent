@@ -23,18 +23,31 @@ cursor = conn.cursor()
 cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 conn.commit()
 
+def delete_table(conn, table_name):
+    cursor = conn.cursor()
+    table_name = str(table_name)
+    cursor.execute(
+        f"""
+        DROP TABLE {table_name}
+        """
+    )
+
+    conn.commit()
+    cursor.close()
+
 cursor.execute(
     """CREATE TABLE IF NOT EXISTS meeting_recording(
-    id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    meeting_id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     context TEXT,
-    meeting_id VARCHAR NOT NULL,
+    meeting_title VARCHAR(50),
+    meeting_title_emb VECTOR(1536),
     embedding VECTOR(1536)
     );"""
 )
 
 # Evaluating embedding insertion
 text = "The Q3 revenue was $4.2M, up 15% from last quarter."
-meeting_id = "meeting_001"
+meeting_title = "test meeting"
 
 response = client.embeddings.create(
     input=text,
@@ -46,10 +59,10 @@ embedding = response.data[0].embedding
 cursor.execute(
     """
     INSERT INTO meeting_recording(
-        context, meeting_id, embedding
-    ) VALUES (%s, %s, %s)
+        context, embedding
+    ) VALUES (%s, %s)
     """, (
-        text, meeting_id, embedding
+        text, embedding
     )
 )
 

@@ -5,7 +5,7 @@ from livekit import api
 
 async def setup_sip():
     lk = api.LiveKitAPI(
-        url="ws://192.168.3.126:7880",
+        url="ws://192.168.0.127:7880",
         api_key="APIuoFDt5njRYLA",
         api_secret="MooeqeW9ae5QvvlgjFFGbuFkzA7160g9e5mSVPfAbEIH",
     )

@@ -148,7 +148,6 @@ async def my_agent(ctx: JobContext):
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
-        tools=[insert_meeting_recording]
     )
 
     @session.on("user_input_transcribed")

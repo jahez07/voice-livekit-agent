@@ -17,9 +17,13 @@ from livekit.agents import (
     ChatContext,
     ChatMessage,
     StopResponse,
-    inference
+    function_tool,
+    RunContext,
 )
+import psycopg2
+import os
 
+from openai import OpenAI
 from livekit.plugins import cartesia, openai, silero, elevenlabs
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -28,10 +32,28 @@ logger = logging.getLogger("agent")
 load_dotenv(".env")
 
 ELEVENLABS_API = os.getenv('ELEVENLABS_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
-def _matches(self, text: str, mode: str) -> bool:
-    t = re.sub(r"[^a-z\s]", "", text.lower())
-    return ("vision" in t or "division" in t) and mode in t and "mode" in t
+def open_connection():
+    conn = psycopg2.connect(
+        database = 'rag',
+        user = 'postgres',
+        host = 'localhost',
+        password = 'postgres',
+        port = 5435
+    )
+    return conn
+
+def get_embeddings(text):
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    response = client.embeddings.create(
+        input=text,
+        model='text-embedding-3-small'
+    )
+    embedding = response.data[0].embedding
+
+    return embedding
+
 
 
 class Assistant(Agent):
@@ -40,9 +62,10 @@ class Assistant(Agent):
             llm=openai.LLM(model="gpt-4o-mini"),
             instructions=textwrap.dedent(
                 """\
-                Ask the user to select between
-                active mode
-                passive mode
+                You are polite assistant that helps the company employees to manage meetings and record meeting recordings to store it.
+                When you spun up for the first time, you must always ask the user if they want "active mode" or "passive mode" and for them to select, they have to say either "vision active mode" or "vision passive mode"
+
+                Whichever mode you are in, until the meeting is over, you have to store the meeting embedding to a pgvector db. You can use the 'insert_meeting_recording' tool to insert meeting recording embedding.
                 """
             ),
         )
@@ -63,6 +86,40 @@ class Assistant(Agent):
             turn_ctx.items.append(new_message)
             await self.update_chat_ctx(turn_ctx)
             raise StopResponse()
+        
+    @function_tool()
+    async def insert_meeting_recording(
+        self,
+        context: RunContext,
+        meeting_title: str,
+        meeting_content: str,
+    ) -> str:
+        """Insert a meeting trasncript with its embedding into pgvector for RAG retrieval.
+
+        Args:
+            meeting_title: The title or name of the meeting, e.g. 'Q3 Revenue Review'.
+            meeting_content: The transcript or text content from the meeting to store.
+        """
+        import asyncio
+        def _do_insert():
+            conn = open_connection()
+            cursor = conn.cursor()
+            meeting_title_emb = get_embeddings(meeting_title)
+            embeddings = get_embeddings(context)
+            cursor.execute(
+                """
+                INSERT INTP meeting_recording(
+                    context, meeting_title, meeting_title_emb, embedding
+                ) VALUES (%s, %s, %s, %s)
+                """, (meeting_content, meeting_title, meeting_title_emb, embeddings)
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+        
+        await asyncio.get_event_loop().run_in_executor(None, _do_insert)
+        return f"Stored meeting '{meeting_title}' in the database"
+
     
 
 
@@ -91,6 +148,7 @@ async def my_agent(ctx: JobContext):
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
+        tools=[insert_meeting_recording]
     )
 
     @session.on("user_input_transcribed")

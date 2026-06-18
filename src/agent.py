@@ -1,6 +1,7 @@
 import os
-import re
+import json
 import logging
+import psycopg2
 import textwrap
 
 from dotenv import load_dotenv
@@ -20,9 +21,7 @@ from livekit.agents import (
     function_tool,
     RunContext,
 )
-import psycopg2
-import os
-
+from qdrant_client import QdrantClient
 from openai import OpenAI
 from livekit.plugins import cartesia, openai, silero, elevenlabs
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -30,7 +29,6 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 logger = logging.getLogger("agent")
 
 load_dotenv(".env")
-
 ELEVENLABS_API = os.getenv('ELEVENLABS_API_KEY')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
@@ -38,7 +36,7 @@ def open_connection():
     conn = psycopg2.connect(
         database = 'rag',
         user = 'postgres',
-        host = 'localhost',
+        host = 'host.docker.internal',
         password = 'postgres',
         port = 5435
     )
@@ -46,15 +44,40 @@ def open_connection():
 
 def get_embeddings(text):
     client = OpenAI(api_key=OPENAI_API_KEY)
-    response = client.embeddings.create(
-        input=text,
-        model='text-embedding-3-small'
-    )
-    embedding = response.data[0].embedding
+    response = client.embeddings.create(input=text,model='text-embedding-3-small')
 
-    return embedding
+    return response.data[0].embedding
+
+def get_qdrant_client():
+    client = QdrantClient(url="http://qdrant:6333")
+
+    return client
 
 
+def get_sureflow_info(query, client):
+    search_result = client.query_points(
+        collection_name="sureflow",
+        query=query,
+        with_payload=True,
+        limit=3
+    ).points
+
+    result = []
+    for point in search_result:
+        result.append(
+            f"Section: {point.payload['section']}\nContent: {point.payload['content']}"
+        )
+
+    return result
+    
+
+# --------------------------------------------------
+# State machine
+# --------------------------------------------------
+# mode:             "active" | "passive"
+# record_status:    "idle"   | "recording" | "ended"
+# meeting_status:   "idle"   | "ongoing"   | "ended"
+# --------------------------------------------------
 
 class Assistant(Agent):
     def __init__(self) -> None:
@@ -62,28 +85,89 @@ class Assistant(Agent):
             llm=openai.LLM(model="gpt-4o-mini"),
             instructions=textwrap.dedent(
                 """\
-                You are polite assistant that helps the company employees to manage meetings and record meeting recordings to store it.
-                When you spun up for the first time, you must always ask the user if they want "active mode" or "passive mode" and for them to select, they have to say either "vision active mode" or "vision passive mode"
+                You are a polite assistant that helps company employees manage
+                meetings and store meeting recordings.
 
-                Whichever mode you are in, until the meeting is over, you have to store the meeting embedding to a pgvector db. You can use the 'insert_meeting_recording' tool to insert meeting recording embedding.
+                When you first start, greet the user and ask them to choose a mode
+                by saying "vision active mode" or "vision passive mode".
+
+                In PASSIVE mode you are silent. You do NOT speak or respond.
+                The meeting transcript is being captured in the background.
+
+                In ACTIVE mode you interact normally. If a recording exists you
+                should ask whether the user wants to store it. Use the
+                'insert_meeting_recording' tool when they confirm.
+
+                If you are ever asked about SureFlow, use 'sureflow_information_retrieval' tool.
                 """
             ),
         )
-        self.active = True
+        # state
+        self.mode: str = "active"
+        self.record_status: str = "idle"
+        self.meeting_status: str = "idle"
+        self.meeting_title: str = ""
+        self.transcript_lines: list[str] = []
+
+
+    # -- hook: runs before the LLM replies -----------------------------------------------
     async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage):
         text = (new_message.text_content or "").lower()
 
-        if "vision" in text and "active mode" in text:
-            self.active = True
-            return
-        
-        if ("vision" in text and "passive mode") or ("passive mode") in text:
-            self.active = False
-            await self.session.say("Going quiet. Say 'vision active mode' when you need me.")
+        # --- Switch to PASSIVE MODE ------------------------------------
+        if "vision" in text and "passive mode" in text:
+            self.mode = "passive"
+            self.record_status = "recording"
+            self.meeting_status = "ongoing"
+
+            # Ask for a meeting title before going quiet
+            await self.session.say(
+                "Passive mode activated. What would you like the meeting title to be?"
+                "You can let me know the title now or what the meeting would be about - I'll capture it for you and go silent."
+            )
             raise StopResponse()
         
-        if not self.active:
+        # --- Switch to ACTIVE MODE -------------------------------------
+        if "vision" in text and "active mode" in text:
+            self.mode = "active"
+
+            if self.record_status == "recording":
+                # Inject context so the LLM knows to ask about storing
+                turn_ctx.add_message(
+                    role="assistant",
+                    content=(
+                        "[System] The user switched to active mode."
+                        "A meeting is in progress."
+                        "How can I help you?"
+                    ),
+                )
+                return
+            
+            if self.record_status == "ended":
+                turn_ctx.add_message(
+                    role="assistant",
+                    content=(
+                        "[System] The recording has already been stored."
+                        "Ask: 'What else can I help you with?'"
+                    ),
+                )
+                return
+            return
+        
+        if self.mode == "passive":
+            # Capture meeting title if we do not have one yet
+            if not self.meeting_title:
+                self.meeting_title = new_message.text_content or "Untitled Meeting"
+                await self.session.say(
+                    f"Got it - '{self.meeting_title}'. Going silent now."
+                    "Say 'vision active mode' when the meeting is over."
+                )
+                raise StopResponse
+            
+            # Otherwise just accumlate the transcript - no LLM reply
+            self.transcript_lines.append(new_message.text_content or "")
             turn_ctx.items.append(new_message)
+
             await self.update_chat_ctx(turn_ctx)
             raise StopResponse()
         
@@ -105,10 +189,10 @@ class Assistant(Agent):
             conn = open_connection()
             cursor = conn.cursor()
             meeting_title_emb = get_embeddings(meeting_title)
-            embeddings = get_embeddings(context)
+            embeddings = get_embeddings(meeting_content)
             cursor.execute(
                 """
-                INSERT INTP meeting_recording(
+                INSERT INTO meeting_recording(
                     context, meeting_title, meeting_title_emb, embedding
                 ) VALUES (%s, %s, %s, %s)
                 """, (meeting_content, meeting_title, meeting_title_emb, embeddings)
@@ -120,7 +204,40 @@ class Assistant(Agent):
         await asyncio.get_event_loop().run_in_executor(None, _do_insert)
         return f"Stored meeting '{meeting_title}' in the database"
 
-    
+    # Sureflow RAG
+    @function_tool()
+    async def sureflow_information_retrieval(
+        self,
+        context: RunContext,
+        query: str,
+    ) -> str:
+        """You can use this tool if you are asked about Sureflow and if you do not know anything about SureFlow.
+
+        Args:
+            query: The doubt you have about SureFlow.
+        """
+        import asyncio
+        def _do_retrieve():
+            client = get_qdrant_client()
+            embedded_query = get_embeddings(query)
+            search_result = client.query_points(
+                collection_name="sureflow",
+                query=embedded_query,
+                with_payload=True,
+                limit=3,
+            ).points
+            
+            chunks = []
+            for point in search_result:
+                chunks.append(
+                    f"Section: {point.payload['section']}"
+                    f"\nContent: {point.payload['content']}"
+                )
+            return "\n\n---\n\n".join(chunks)
+            
+        result = await asyncio.get_event_loop().run_in_executor(None, _do_retrieve)
+        return result
+        
 
 
 server = AgentServer()

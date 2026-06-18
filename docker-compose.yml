@@ -38,14 +38,19 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.agent
+    entrypoint: ["bash", "entrypoint.sh"]
     env_file:
       - .env
     environment:
       - LIVEKIT_URL=ws://livekit-server:7880
       - DATABASE_URL=postgresql://postgres:postgres@pgvector:5435/rag
+      - QDRANT_URL=http://qdrant:6333
+      - PG_HOST=pgvector
+      - PG_PORT=5432
     depends_on:
       - livekit-server
       - pgvector
+      - qdrant
     restart: unless-stopped
     develop:
       watch:
@@ -104,7 +109,17 @@ services:
         use_external_ip: true
         logging:
           level: debug
+  
+  qdrant:
+    image: qdrant/qdrant:v1
+    ports:
+      - "6333:6333" # REST API
+      - "6334:6334" # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
 
 volumes:
   redis_data:
   pgvector_data:
+  qdrant_data:

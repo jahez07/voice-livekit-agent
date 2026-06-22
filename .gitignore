@@ -34,3 +34,6 @@ KMS
 
 # uv 
 uv.lock
+
+# tests
+test.py

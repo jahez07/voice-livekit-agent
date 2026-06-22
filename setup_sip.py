@@ -1,11 +1,15 @@
 import asyncio
+import os
 
+from dotenv import load_dotenv
 from livekit import api
 
+load_dotenv(".env")
+IP_ADDRESS = os.getenv("IP_ADDRESS")
 
 async def setup_sip():
     lk = api.LiveKitAPI(
-        url="ws://192.168.0.127:7880",
+        url=f"ws://{IP_ADDRESS}:7880",
         api_key="APIuoFDt5njRYLA",
         api_secret="MooeqeW9ae5QvvlgjFFGbuFkzA7160g9e5mSVPfAbEIH",
     )

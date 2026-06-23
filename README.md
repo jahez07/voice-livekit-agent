@@ -72,17 +72,17 @@ LIVEKIT_API_SECRET=
 
 # Models
 OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o            # the agent LLM
-EMBEDDING_MODEL=text-embedding-3-small
+OPENAI_MODEL=
+EMBEDDING_MODEL=
 ELEVENLABS_API_KEY=           # optional, only if you switch to ElevenLabs TTS
 
 # Vector / relational stores
-QDRANT_URL=http://localhost:6333
-PG_HOST=localhost
-PG_PORT=5435
-PG_USER=postgres
-PG_PASSWORD=postgres
-PG_DATABASE=rag
+QDRANT_URL=
+PG_HOST=
+PG_PORT=
+PG_USER=
+PG_PASSWORD=
+PG_DATABASE=
 
 # Telephony (setup_sip.py)
 IP_ADDRESS=                   # host IP the SIP service binds to

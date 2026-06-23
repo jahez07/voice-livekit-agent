@@ -1,5 +1,6 @@
 import os
 import json
+import yaml
 import logging
 import psycopg2
 import textwrap
@@ -20,8 +21,12 @@ from livekit.agents import (
     StopResponse,
     function_tool,
     RunContext,
+    inference
 )
+from dataclasses import dataclass, field
 from qdrant_client import QdrantClient
+from typing import Annotated
+from pydantic import Field
 from openai import OpenAI
 from langdetect import detect
 from livekit.plugins import cartesia, openai, silero, elevenlabs
@@ -33,333 +38,325 @@ load_dotenv(".env")
 ELEVENLABS_API = os.getenv("ELEVENLABS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+voices = {
+    "greeter": "e07c00bc-4134-4eae-9ea4-1a55fb45746b",
+    "reservation": "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+    "takeaway": "5ee9feff-1265-424a-9d7f-8e4d431a12c7",
+    "checkout": "a167e0f3-df7e-4d52-a9c3-f949145efdab",
+}
 
-def open_connection():
-    conn = psycopg2.connect(
-        database="rag",
-        user="postgres",
-        host="host.docker.internal",
-        password="postgres",
-        port=5435,
-    )
-    return conn
+# Class to collect data
+@dataclass
+class UserData:
+    customer_name: str | None = None
+    customer_phone: str | None = None
 
+    reservation_time: str | None = None
 
-def get_embeddings(text):
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    response = client.embeddings.create(input=text, model=os.getenv("EMBEDDING_MODEL"))
+    order: list[str] | None = None
 
-    return response.data[0].embedding
+    customer_credit_card: str | None = None
+    customer_credit_card_expiry: str | None = None
+    customer_credit_card_cvv: str | None = None
 
+    expense: float | None = None
+    checked_out: bool | None = None
 
-def get_qdrant_client():
-    client = QdrantClient(url=os.getenv("QDRANT_URL"))
+    agents: dict[str, Agent] = field(default_factory=dict)
+    prev_agent: Agent | None = None
 
-    return client
-
-
-# --------------------------------------------------
-# VAD tuning profiles
-# --------------------------------------------------
-# activation_threshold: higher -> more conservative, less background noise
-#                       reaches the STT (but may miss very soft speech).
-# min_speech_duration:  higher -> rejects short transient noise (clicks,
-#                       coughs, distant chatter) before it opens a speech chunk.
-#
-# ACTIVE  -> conservative. Used on startup and in "vision active mode" so only
-#            the user talking to the agent reaches the STT, not the room noise.
-# PASSIVE -> sensitive. Used in "vision passive mode" meeting capture so all
-#            speakers (including softer/farther ones) are transcribed.
-VAD_ACTIVE_PROFILE = dict(activation_threshold=0.7, min_speech_duration=0.15)
-VAD_PASSIVE_PROFILE = dict(activation_threshold=0.5, min_speech_duration=0.05)
-
-
-# --------------------------------------------------
-# State machine
-# --------------------------------------------------
-# mode:             "active" | "passive"
-# record_status:    "idle"   | "recording" | "ended"
-# meeting_status:   "idle"   | "ongoing"   | "ended"
-# --------------------------------------------------
+    def summarize(self) -> str:
+        data = {
+            "customer_name": self.customer_name or "unknown",
+            "customer_phone": self.customer_phone or "unkown",
+            "reservation_time": self.reservation_time or "unknown",
+            "order": self.order or "unknown",
+            "credit_card": {
+                "number": self.customer_credit_card or "unknown",
+                "expiry": self.customer_credit_card_expiry or "unknown",
+                "cvv": self.customer_credit_card_expiry or "unknown",
+            }
+            if self.customer_credit_card
+            else None,
+            "expense": self.expense or "unknown",
+            "checked_out": self.checked_out or False,
+        }
+        return yaml.dump(data)
+    
+RunContext_T = RunContext[UserData]
 
 
-class Assistant(Agent):
+# Shared tools
+@function_tool()
+async def update_name(
+    name: Annotated[str, Field(description="The customer's name")],
+    context: RunContext_T,
+) -> str:
+    """Called when the user provides their name.
+    Confirm the spelling with the user before calling this function."""
+    userdata = context.userdata
+    userdata.customer_name = name
+    return f"The name is updated to {name}"
+
+@function_tool()
+async def update_phone(
+    phone: Annotated[str, Field(description="The customer's phone number")],
+    context: RunContext_T,
+) -> str:
+    """Called when the user provides theor phone number.
+    Confirm the phone number with the user before calling this function"""
+    userdata = context.userdata
+    userdata.customer_phone = phone
+    return f"The phone number is updated to {phone}"
+
+@function_tool()
+async def to_greeter(context: RunContext_T) -> Agent:
+    """Called when user asks unrelated questions or requests
+    any other services not in your job description."""
+    curr_agent: BaseAgent = context.session.current_agent
+    return await curr_agent._transfer_to_agent("greeter", context)
+
+
+# Base agent
+class BaseAgent(Agent):
+    """Base class that every specialist agent extends. Handles two things
+    that all agents need: copying context from the previous agent on entry,
+    and transferring control to the next agent on exit."""
+
+    async def on_enter(self) -> None:
+        """Called by the framework when this agent becomes active."""
+        agent_name = self.__class__.__name__
+        logger.info(f"entering task {agent_name}")
+
+        userdata: UserData = self.session.userdata
+        chat_ctx = self.chat_ctx.copy()
+
+        # Copy the last few turns from the previous agent so this agent
+        # has conversational continuity without carrying the full history.=
+        # truncate(max_item=6)keeps context growth bounded across handoffs.
+        if isinstance(userdata.prev_agent, Agent):
+            truncated_chat_ctx = userdata.prev_agent.chat_ctx.copy(
+                exclude_instructions=True,
+                exclude_function_call=False,
+                exclude_handoff=True,
+                exclude_config_update=True,
+            ).truncate(max_items=6)
+            existing_ids = {item.id for item in chat_ctx.items}
+            items_copy = [item for item in truncated_chat_ctx.items if item.id not in existing_ids]
+            chat_ctx.items.extend(items_copy)
+        
+        # Inject the serialized UserData as a system message so this agent
+        # knows the customer name, order, and other collected data.
+        chat_ctx.add_message(
+            role="system",
+            content=f"You are {agent_name} agent. Current user data is {userdata.summarize()}",
+        )
+        await self.update_chat_ctx(chat_ctx)
+        self.session.generate_reply(tool_choice="none")
+
+    async def _transfer_to_agent(self, name: str, context: RunContext_T) -> tuple[Agent, str]:
+        """Look up the next agent by name from the shared registry and hand
+        off control. Returning an (Agent, str) tuple from a tool triggers
+        the framework's handoff mechanism."""
+        userdata = context.userdata
+        current_agent = context.session.current_agent
+        next_agent = userdata.agents[name]
+        userdata.prev_agent = current_agent
+
+        return next_agent, f"Transferring to {name}."
+
+
+# Greeting Agent
+class Greeter(BaseAgent):
+    def __init__(self, menu: str) -> None:
+        super().__init__(
+            instructions=(
+                f"You are a friendly restaurant receptionist. The menu is: {menu}\n"
+                "Your jobs are to greet the caller and understand if they want to "
+                "make a reservation or order takeaway. Guide them to the right agent using tools."
+            ),
+            llm=openai.LLM(model=os.getenv("OPENAI_MODEL"), parallel_tool_calls=False),
+            tts=cartesia.TTS(model="sonic-3", voice=voices["greeter"]),
+        )
+        self.menu = menu
+    
+    @function_tool()
+    async def to_reservation(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Called when user wants to make or update a reservation.
+        This function handles a transitioning to the reservation agent
+        who will collect the necessary details like reservation time,
+        customer name and phone number."""
+        return await self._transfer_to_agent("reservation", context)
+    
+    @function_tool()
+    async def to_takeaway(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Called when the user wants to place a takeaway order.
+        This includes handling orders for pickup, delivery, or when the user wants to
+        proceed to checkout with their existing order."""
+        return await self._transfer_to_agent("takeaway", context)
+    
+
+# Reservation Agent
+class Reservation(BaseAgent):
     def __init__(self) -> None:
         super().__init__(
-            llm=openai.LLM(model=os.getenv("OPENAI_MODEL")),
-            instructions=textwrap.dedent(
-                """\
-                You are a polite assistant that helps company employees manage
-                meetings and store meeting recordings.
-
-                When you first start, greet the user and ask them to choose a mode
-                by saying "vision active mode" or "vision passive mode".
-
-                In PASSIVE mode you are silent. You do NOT speak or respond.
-                The meeting transcript is being captured in the background.
-
-                In ACTIVE mode you interact normally. If a recording exists you
-                should ask whether the user wants to store it. Use the
-                'insert_meeting_recording' tool when they confirm.
-
-                If you are ever asked about SureFlow, use 'sureflow_information_retrieval' tool.
-                """
-            ),
+            instructions="You are a reservation agent at a restaurant. Your jobs are to ask for "
+            "the reservation time, then customer's name, and phone number. Then "
+            "confirm the reservation details with the customer.",
+            tools=[update_name, update_phone, to_greeter],
+            tts=cartesia.TTS(model="sonic-3", voice=voices["reservation"]),
         )
-        # state
-        self.mode: str = "active"
-        self.record_status: str = "idle"
-        self.meeting_status: str = "idle"
-        self.meeting_title: str = ""
-        self.transcript_lines: list[str] = []
+    
+    @function_tool()
+    async def update_reservation_time(
+        self,
+        time: Annotated[str, Field(description="The reservation time")],
+        context: RunContext_T,
+    ) -> str:
+        """Called when the user provides their reservation time.
+        Confirm the time with the user before calling the function."""
+        userdata = context.userdata
+        userdata.reservation_time = time
+        return f"The reservation time updated to {time}"
+    
+    @function_tool()
+    async def confirm_reservation(self, context: RunContext_T) -> str | tuple[Agent, str]:
+        """Called when the user confirms the reservation."""
+        userdata = context.userdata
+        if not userdata.customer_name or not userdata.customer_phone:
+            return "Please provide your name and phone first."
+        
+        if not userdata.reservation_time:
+            return "Please provide reservation time first."
+        
+        return await self._transfer_to_agent("greeter", context)
 
-    # -- adjust how much sound reaches the STT for the current mode ----------------------
-    def _apply_vad_profile(self, profile: dict) -> None:
-        vad = self.session.vad
-        if vad is None:
-            return
-        vad.update_options(**profile)
-        logger.info(f"Applied VAD profile: {profile}")
 
-    # -- hook: runs before the LLM replies -----------------------------------------------
-    async def on_user_turn_completed(
-        self, turn_ctx: ChatContext, new_message: ChatMessage
-    ):
-        text = (new_message.text_content or "").lower()
-
-        # --- Switch to PASSIVE MODE ------------------------------------
-        if "vision" in text and "passive mode" in text:
-            self.mode = "passive"
-            self.record_status = "recording"
-            self.meeting_status = "ongoing"
-
-            # Meeting capture: widen VAD so all speakers are transcribed.
-            self._apply_vad_profile(VAD_PASSIVE_PROFILE)
-
-            # Ask for a meeting title before going quiet
-            await self.session.say(
-                "Passive mode activated. What would you like the meeting title to be?"
-                "You can let me know the title now or what the meeting would be about - I'll capture it for you and go silent."
-            )
-            raise StopResponse()
-
-        # --- Switch to ACTIVE MODE -------------------------------------
-        if "vision" in text and "active mode" in text:
-            self.mode = "active"
-
-            # Conversing 1:1: tighten VAD so background noise stays out of the STT.
-            self._apply_vad_profile(VAD_ACTIVE_PROFILE)
-
-            if self.record_status == "recording":
-                # Inject context so the LLM knows to ask about storing
-                turn_ctx.add_message(
-                    role="assistant",
-                    content=(
-                        "[System] The user switched to active mode."
-                        "A meeting is in progress."
-                        "How can I help you?"
-                    ),
-                )
-                return
-
-            if self.record_status == "ended":
-                turn_ctx.add_message(
-                    role="assistant",
-                    content=(
-                        "[System] The recording has already been stored."
-                        "Ask: 'What else can I help you with?'"
-                    ),
-                )
-                return
-            return
-
-        if self.mode == "passive":
-            # Capture meeting title if we do not have one yet
-            if not self.meeting_title:
-                self.meeting_title = new_message.text_content or "Untitled Meeting"
-                await self.session.say(
-                    f"Got it - '{self.meeting_title}'. Going silent now."
-                    "Say 'vision active mode' when the meeting is over."
-                )
-                raise StopResponse
-
-            # Otherwise just accumlate the transcript - no LLM reply
-            self.transcript_lines.append(new_message.text_content or "")
-            turn_ctx.items.append(new_message)
-
-            await self.update_chat_ctx(turn_ctx)
-            raise StopResponse()
+# Takeaway agent
+class Takeaway(BaseAgent):
+    def __init__(self, menu: str) -> None:
+        super().__init__(
+            instructions=(
+                f"You are a takeaway agent that takes orders from the customer."
+                f"Our menu is: {menu}"
+                "Clarify special requests and confirm the order from the customer."
+            ),
+            tools=[to_greeter],
+            tts = cartesia.TTS(model="sonic3", voice=voices["takeaway"]),
+        )
 
     @function_tool()
-    async def insert_meeting_recording(
+    async def update_order(
         self,
-        context: RunContext,
-        meeting_title: str,
-        meeting_content: str,
+        items: Annotated[list[str], Field(description="The items of the full order")],
+        context: RunContext_T,
     ) -> str:
-        """Insert a meeting trasncript with its embedding into pgvector for RAG retrieval.
-
-        Args:
-            meeting_title: The title or name of the meeting, e.g. 'Q3 Revenue Review'.
-            meeting_content: The transcript or text content from the meeting to store.
-        """
-        import asyncio
-
-        def _do_insert():
-            conn = open_connection()
-            cursor = conn.cursor()
-            meeting_title_emb = get_embeddings(meeting_title)
-            embeddings = get_embeddings(meeting_content)
-            cursor.execute(
-                """
-                INSERT INTO meeting_recording(
-                    context, meeting_title, meeting_title_emb, embedding
-                ) VALUES (%s, %s, %s, %s)
-                """,
-                (meeting_content, meeting_title, meeting_title_emb, embeddings),
-            )
-            conn.commit()
-            cursor.close()
-            conn.close()
-
-        await asyncio.get_event_loop().run_in_executor(None, _do_insert)
-        return f"Stored meeting '{meeting_title}' in the database"
-
-    # Sureflow RAG
+        """Called when the user creates or updates their order."""
+        userdata = context.userdata
+        userdata.order = items
+        return f"The order is updated to {items}"
+    
     @function_tool()
-    async def sureflow_information_retrieval(
+    async def to_checkout(self, context: RunContext_T) -> str | tuple[Agent, str]:
+        """Called when the user confirms the order."""
+        userdata = context.userdata
+        if not userdata.order:
+            return "No takeaway order found. Please make an order first."
+        
+        return await self._transfer_to_agent("checkout", context)
+
+
+# Checkout agent
+class Checkout(BaseAgent):
+    def __init__(self, menu: str) -> None:
+        super().__init__(
+            instructions=(
+                f"You are a checkout agent at a restaurant. The menu is: {menu}\n"
+                "You are responsible for confirming the expense of the "
+                "order and then collecting customer's name, phone number and credit card "
+                "information, including the card number, expiry date, and CVV step by step."
+            ),
+            tools=[update_name, update_phone, to_greeter],
+            tts=cartesia.TTS(model="sonic-3", voice=voices["checkout"]), 
+        )
+    
+    @function_tool()
+    async def confirm_expense(
         self,
-        context: RunContext,
-        query: str,
+        expense: Annotated[float, Field(description="The expense of the order")],
+        context: RunContext_T,
     ) -> str:
-        """You can use this tool if you are asked about Sureflow and if you do not know anything about SureFlow.
-
-        Args:
-            query: The doubt you have about SureFlow.
-        """
-        import asyncio
-
-        def _do_retrieve():
-            client = get_qdrant_client()
-            embedded_query = get_embeddings(query)
-            search_result = client.query_points(
-                collection_name="sureflow",
-                query=embedded_query,
-                with_payload=True,
-                limit=3,
-            ).points
-
-            chunks = []
-            for point in search_result:
-                chunks.append(
-                    f"Section: {point.payload['section']}"
-                    f"\nContent: {point.payload['content']}"
-                )
-            return "\n\n---\n\n".join(chunks)
-
-        result = await asyncio.get_event_loop().run_in_executor(None, _do_retrieve)
-        return result
+        """Called when the user confirms the expense."""
+        userdata = context.userdata
+        userdata.expense = expense
+        return f"The expense is confirmed to be {expense}"
+    
+    @function_tool()
+    async def update_credit_card(
+        self,
+        number: Annotated[str, Field(description="The credit card number")],
+        expiry: Annotated[str, Field(description="The expiry date of the credit card")],
+        cvv: Annotated[str, Field(description="The CVV of the credit card")],
+        context: RunContext_T,
+    ) -> str:
+        """Called when the user provides their credit card number, expiry date, and CVV.
+        Confirm the spelling with the user before calling the function."""
+        userdata = context.userdata
+        userdata.customer_credit_card = number
+        userdata.customer_credit_card_expiry = expiry
+        userdata.customer_credit_card_cvv = cvv
+        return f"The credit card number is update to {number}"
+    
+    @function_tool()
+    async def confirm_checkout(self, context: RunContext_T) -> str | tuple[Agent, str]:
+        """Called when the user confirms the checkout."""
+        userdata = context.userdata
+        if not userdata.expense:
+            return "Please confirm the expense first."
+        
+        if (
+            not userdata.customer_credit_card
+            or not userdata.customer_credit_card_expiry
+            or not userdata.customer_credit_card_cvv
+        ):
+            return "Please provide the credit card information first."
+        
+        userdata.checked_out = True
+        return await to_greeter(context)
+    
+    @function_tool()
+    async def to_takeaway(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Called when the user wants to update their order."""
+        return await self._transfer_to_agent("takeaway", context)
 
 
 server = AgentServer()
 
-
-def prewarm(proc: JobProcess):
-    # Start conservative: the agent boots in "active" mode, so reject room
-    # noise from the very first turn. Passive mode loosens this at runtime.
-    proc.userdata["vad"] = silero.VAD.load(**VAD_ACTIVE_PROFILE)
-
-
-server.setup_fnc = prewarm
-
-
-@server.rtc_session(agent_name="my-agent")
-async def my_agent(ctx: JobContext):
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
-    }
-
-    # Per-language Cartesia voices. Swap these IDs for the voices you prefer.
-    voice_by_lang = {
-        "en": "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",  # English voice
-        "fr": "65b25c5d-ff07-4687-a04c-da2f43ef6fa9",  # French voice
-    }
-    default_lang = "en"
-
-    session = AgentSession(
-        stt=openai.STT(
-            model="gpt-4o-mini-transcribe",
-        ),
-        tts=cartesia.TTS(
-            model="sonic-3",
-            language=default_lang,
-            voice=voice_by_lang[default_lang],
-            speed=1.0
-        ),
-        # tts=elevenlabs.TTS(model="eleven_flash_v2_5", voice_id="Xb7hH8MSUJpSbSDYk0k2"),
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
+@server.rtc_session()
+async def entrypoint(ctx: JobContext):
+    menu = "Pizza: $10, Salad: $5, Ice Cream: $3, Coffee: $2"
+    userdata = UserData()
+    userdata.agents.update(
+        {
+            "greeter": Greeter(menu),
+            "reservation": Reservation(),
+            "takeaway": Takeaway(menu),
+            "checkout": Checkout(menu)
+        }
     )
-
-    # Track the active language so we only update the TTS when it actually changes.
-    current_lang = default_lang
-
-    @session.on("user_input_transcribed")
-    def on_user_input_transcribed(event: UserInputTranscribedEvent):
-        logger.info(
-            f"User input transcribed: {event.transcript},"
-            f"language: {event.language},"
-            f"speaker id: {event.speaker_id}"
-        )
-
-        # Normalize e.g. "fr-FR" -> "fr", then switch voice if the language changed.
-        nonlocal current_lang
-
-        try:
-            detected = detect(event.transcript)
-        except Exception:
-            detected = "en"
-
-        
-        lang = detected.split("-")[0]
-        if lang in voice_by_lang and lang != current_lang:
-            current_lang = lang
-            session.tts.update_options(
-                language=current_lang,
-                voice=voice_by_lang[current_lang],
-            )
-            logger.info(f"Switched Cartesia voice to '{lang}'")
-
-    @session.on("conversation_item_added")
-    def on_conversation_item_added(event: ConversationItemAddedEvent):
-        if not isinstance(event.item, ChatMessage):
-            return
-        logger.info(
-            f"Conversation item added from {event.item.role}. interrupted: {event.item.interrupted}"
-        )
-
-        for content in event.item.content:
-            if isinstance(content, str):
-                logger.info(f"   - text: {content}")
+    session = AgentSession[UserData](
+        userdata=userdata,
+        stt=openai.STT(model="gpt-4o-mini-transcribe"),
+        llm=openai.LLM(model="gpt-4o-mini"),
+        tts=cartesia.TTS(model="sonic-3"),
+        vad=silero.VAD.load(),
+        max_tool_steps=5,
+    )
 
     await session.start(
-        agent=Assistant(),
+        agent=userdata.agents["greeter"],
         room=ctx.room,
-        room_options=room_io.RoomOptions(
-            text_output=room_io.TextOutputOptions(
-                json_format=True,
-                sync_transcription=True,
-            )
-        ),
     )
-
-    await session.generate_reply(
-        
-    )
-
-    await ctx.connect()
-
 
 if __name__ == "__main__":
     cli.run_app(server)

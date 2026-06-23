@@ -2,162 +2,193 @@
   <img src="./.github/assets/livekit-mark.png" alt="LiveKit logo" width="100" height="100">
 </a>
 
-# LiveKit Agents Starter - Python
+# SureFlow Voice Agent
 
-A complete starter project for building voice AI apps with [LiveKit Agents for Python](https://github.com/livekit/agents) and [LiveKit Cloud](https://cloud.livekit.io/).
+A voice AI assistant for **meeting management** and **company knowledge retrieval**, built on [LiveKit Agents for Python](https://github.com/livekit/agents).
 
-The starter project includes:
+The agent listens in on meetings, captures and stores transcripts for later semantic search, and answers questions about SureFlow from a curated knowledge base. It speaks multiple languages, switches its voice to match the language being spoken, and can be reached over the web or the phone.
 
-- A simple voice AI assistant, ready for extension and customization
-- A voice AI pipeline built on [LiveKit Inference](https://docs.livekit.io/agents/models/inference)
-  with [models](https://docs.livekit.io/agents/models) from OpenAI, Cartesia, and Deepgram. More than 50 other model providers are supported, including [Realtime models](https://docs.livekit.io/agents/models/realtime)
-- Eval suite based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/)
-- [LiveKit Turn Detector](https://docs.livekit.io/agents/logic/turns/turn-detector/) for contextually-aware speaker detection, with multilingual support
-- [Background voice cancellation](https://docs.livekit.io/transport/media/noise-cancellation/)
-- Deep session insights from LiveKit [Agent Observability](https://docs.livekit.io/deploy/observability/)
-- A Dockerfile ready for [production deployment to LiveKit Cloud](https://docs.livekit.io/deploy/agents/)
+## What it does
 
-This starter app is compatible with any [custom web/mobile frontend](https://docs.livekit.io/frontends/) or [telephony](https://docs.livekit.io/telephony/).
+- **Active / Passive modes** — A spoken state machine driven by voice commands:
+  - Say **"vision passive mode"** and the agent goes silent, widens its voice-activity detection so every speaker in the room is transcribed, and quietly captures the meeting transcript in the background.
+  - Say **"vision active mode"** and it tightens VAD to filter room noise, comes back to life, and offers to store the meeting it just captured.
+- **Meeting capture & storage** — Transcripts are embedded with OpenAI and stored in **Postgres + pgvector** (`meeting_recording` table) for semantic retrieval, via the `insert_meeting_recording` tool.
+- **SureFlow knowledge base (RAG)** — Questions about SureFlow are answered from a company profile indexed in **Qdrant**, via the `sureflow_information_retrieval` tool.
+- **Multilingual voice** — STT runs on `gpt-4o-mini-transcribe`; the agent detects the spoken language and swaps the [Cartesia](https://cartesia.ai/) `sonic-3` voice between English and French on the fly. ([ElevenLabs](https://elevenlabs.io/) TTS is wired up as an alternative.)
+- **Turn detection & noise handling** — Uses the [LiveKit multilingual turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/) plus tunable [Silero VAD](https://docs.livekit.io/agents/logic/turns/vad/) profiles for active vs. passive listening.
+- **Web + telephony entry points** — A Flask API mints LiveKit tokens for a web frontend and handles inbound Twilio calls; a SIP trunk (3CX) supports inbound phone calls.
 
-## Using coding agents
+## Architecture
 
-This project is designed to work with coding agents like [Claude Code](https://claude.com/product/claude-code), [Cursor](https://www.cursor.com/), and [Codex](https://openai.com/codex/).
-
-For your convenience, LiveKit offers both a CLI and an [MCP server](https://docs.livekit.io/reference/developer-tools/docs-mcp/) that can be used to browse and search its documentation. The [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/) (`lk docs`) works with any coding agent that can run shell commands. Install it for your platform:
-
-**macOS:**
-
-```console
-brew install livekit-cli
+```
+┌──────────────┐     web token / Twilio webhook      ┌──────────────────┐
+│  Frontend /  │ ─────────────────────────────────►  │  api_server.py   │
+│  Phone (SIP) │                                     │  (Flask, :5001)  │
+└──────────────┘                                     └──────────────────┘
+        │                                                     │ dispatch "my-agent"
+        ▼                                                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       LiveKit Server (rtc)                          │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────┐   embeddings    ┌───────────────────┐
+│   agent.py       │ ──────────────► │pgvector (Postgres)│  meeting transcripts
+│   (Assistant)    │                 └───────────────────┘
+│  active/passive  │   embeddings    ┌───────────────────┐
+│  STT/LLM/TTS     │ ──────────────► │  Qdrant           │  SureFlow knowledge base
+└──────────────────┘                 └───────────────────┘
 ```
 
-**Linux:**
+| File | Role |
+|------|------|
+| `src/agent.py` | The voice agent: `Assistant` agent, mode state machine, VAD profiles, language-switching TTS, and the two function tools. **Entrypoint** (`my-agent`). |
+| `src/api_server.py` | Flask service: `/getToken` for the web frontend, `/incoming-call` Twilio webhook, `/health`. |
+| `src/db_utils.py` | Standalone Postgres/pgvector helpers (embedding + insert) used outside the agent. |
+| `init_services.py` | Startup bootstrap: waits for Postgres & Qdrant, creates the `rag` DB and `meeting_recording` table, then creates the `sureflow` Qdrant collection and ingests the knowledge base. |
+| `setup_sip.py` | Creates the inbound SIP trunk and dispatch rule for telephony. |
+| `knowledge_base/` | `SureFlow_Company_Profile.md` (the RAG source) and ingestion helper. |
+| `db_src/` | Database/vector-store scratch scripts. |
+| `docker-compose.yml` | Self-hosted stack: LiveKit server, Redis, pgvector, Qdrant, pgAdmin, SIP, the API server, and the agent. |
 
-```console
-curl -sSL https://get.livekit.io/cli | bash
-```
+## Prerequisites
 
-**Windows:**
+- Python 3.11+ and the [`uv`](https://docs.astral.sh/uv/) package manager
+- Docker + Docker Compose (for the self-hosted stack)
+- An OpenAI API key (used for STT, the LLM, and embeddings)
+- A Cartesia API key (for TTS) — and optionally ElevenLabs
+- LiveKit credentials (either [LiveKit Cloud](https://cloud.livekit.io/) or the bundled self-hosted server)
 
-```console
-winget install LiveKit.LiveKitCLI
-```
+## Configuration
 
-The `lk docs` subcommand requires version 2.15.0 or higher. Check your version with `lk --version` and update if needed. Once installed, your coding agent can search and browse LiveKit documentation directly from the terminal:
-
-```console
-lk docs search "voice agents"
-lk docs get-page /agents/start/voice-ai-quickstart
-```
-
-See the [Using coding agents](https://docs.livekit.io/intro/coding-agents/) guide for more details, including MCP server setup.
-
-The project includes a complete [AGENTS.md](AGENTS.md) file for these assistants. You can modify this file to suit your needs. To learn more about this file, see [https://agents.md](https://agents.md).
-
-## Dev Setup
-
-Create a project from this template with the LiveKit CLI (recommended):
+Create a `.env` file in the project root. The keys referenced across the code are:
 
 ```bash
-lk cloud auth
-lk agent init my-agent --template agent-starter-python
+# LiveKit
+LIVEKIT_URL=
+LIVEKIT_API_KEY=
+LIVEKIT_API_SECRET=
+
+# Models
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o            # the agent LLM
+EMBEDDING_MODEL=text-embedding-3-small
+ELEVENLABS_API_KEY=           # optional, only if you switch to ElevenLabs TTS
+
+# Vector / relational stores
+QDRANT_URL=http://localhost:6333
+PG_HOST=localhost
+PG_PORT=5435
+PG_USER=postgres
+PG_PASSWORD=postgres
+PG_DATABASE=rag
+
+# Telephony (setup_sip.py)
+IP_ADDRESS=                   # host IP the SIP service binds to
 ```
 
-The CLI clones the template and configures your environment. Then follow the rest of this guide from [Run the agent](#run-the-agent).
+> The Cartesia voice IDs are set in `src/agent.py` (`voice_by_lang`). Swap them for the voices you prefer.
 
-<details>
-<summary>Alternative: Manual setup without the CLI</summary>
+## Running locally (without Docker)
 
-Clone the repository and install dependencies to a virtual environment:
+Install dependencies:
 
-```console
-cd agent-starter-python
+```bash
 uv sync
 ```
 
-Sign up for [LiveKit Cloud](https://cloud.livekit.io/) then set up the environment by copying `.env.example` to `.env.local` and filling in the required keys:
-
-- `LIVEKIT_URL`
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
-
-You can load the LiveKit environment automatically using the [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/):
+Download the local models (Silero VAD + turn detector) the agent needs on first run:
 
 ```bash
-lk cloud auth
-lk app env -w -d .env.local
-```
-
-</details>
-
-## Run the agent
-
-Before your first run, you must download certain models such as [Silero VAD](https://docs.livekit.io/agents/logic/turns/vad/) and the [LiveKit turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/):
-
-```console
 uv run python src/agent.py download-files
 ```
 
-Next, run this command to speak to your agent directly in your terminal:
+Bring up the data stores (or run your own Postgres/pgvector + Qdrant) and bootstrap them:
 
-```console
+```bash
+uv run python init_services.py          # create DB, table, and ingest the knowledge base
+# uv run python init_services.py --force  # drop & recreate everything
+```
+
+Talk to the agent in your terminal:
+
+```bash
 uv run python src/agent.py console
 ```
 
-To run the agent for use with a frontend or telephony, use the `dev` command:
+Run it for a frontend or telephony:
 
-```console
-uv run python src/agent.py dev
+```bash
+uv run python src/agent.py dev     # development
+uv run python src/agent.py start   # production
 ```
 
-In production, use the `start` command:
+Run the token / telephony API:
 
-```console
-uv run python src/agent.py start
+```bash
+uv run python src/api_server.py    # serves on :5001
 ```
 
-## Frontend & Telephony
+## Running the full stack with Docker
 
-Get started quickly with our pre-built frontend starter apps, or add telephony support:
+`docker-compose.yml` brings up everything — LiveKit server, Redis, pgvector, Qdrant, pgAdmin, the SIP service, the Flask API, and the agent. The agent container runs `entrypoint.sh`, which executes `init_services.py` (DB + knowledge-base bootstrap) before starting the agent.
 
-| Platform | Link | Description |
-|----------|----------|-------------|
-| **Web** | [`livekit-examples/agent-starter-react`](https://github.com/livekit-examples/agent-starter-react) | Web voice AI assistant with React & Next.js |
-| **iOS/macOS** | [`livekit-examples/agent-starter-swift`](https://github.com/livekit-examples/agent-starter-swift) | Native iOS, macOS, and visionOS voice AI assistant |
-| **Flutter** | [`livekit-examples/agent-starter-flutter`](https://github.com/livekit-examples/agent-starter-flutter) | Cross-platform voice AI assistant app |
-| **React Native** | [`livekit-examples/voice-assistant-react-native`](https://github.com/livekit-examples/voice-assistant-react-native) | Native mobile app with React Native & Expo |
-| **Android** | [`livekit-examples/agent-starter-android`](https://github.com/livekit-examples/agent-starter-android) | Native Android app with Kotlin & Jetpack Compose |
-| **Web Embed** | [`livekit-examples/agent-starter-embed`](https://github.com/livekit-examples/agent-starter-embed) | Voice AI widget for any website |
-| **Telephony** | [Documentation](https://docs.livekit.io/telephony/) | Add inbound or outbound calling to your agent |
+```bash
+docker compose up --build
+```
 
-For advanced customization, see the [complete frontend guide](https://docs.livekit.io/frontends/).
+Exposed ports:
 
-## Tests and evals
+| Service | Port |
+|---------|------|
+| LiveKit server | `7880` (ws), `7881` (tcp), `7882-7892/udp` |
+| API server | `5001` |
+| pgvector (Postgres) | `5435` → `5432` |
+| Qdrant | `6333` (REST), `6334` (gRPC) |
+| pgAdmin | `5050` |
+| Redis | `6379` |
+| SIP | host network (`5060`, RTP `10000-20000`) |
 
-This project includes a complete suite of evals, based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/). To run them, use `pytest`.
+## Telephony (SIP)
 
-```console
+After the stack is up, create the inbound trunk and dispatch rule:
+
+```bash
+uv run python setup_sip.py
+```
+
+It registers a 3CX inbound trunk and a dispatch rule that routes calls into `call-*` rooms where `my-agent` is dispatched. The script is idempotent — it prints and skips if a trunk/rule already exists. Inbound Twilio calls are handled separately by the `/incoming-call` webhook in `api_server.py`.
+
+## Tests
+
+Behavioral evals built on the LiveKit [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/):
+
+```bash
 uv run pytest
 ```
 
-## Using this template repo for your own project
+When changing agent behavior (instructions, tools, modes), follow the TDD guidance in [`AGENTS.md`](AGENTS.md): write or update a test first, then iterate until it passes.
 
-Once you've started your own project based on this repo, you should:
+## Code style
 
-1. **Check in your `uv.lock`**: This file is currently untracked for the template, but you should commit it to your repository for reproducible builds and proper configuration management. (The same applies to `livekit.toml`, if you run your agents in LiveKit Cloud)
+```bash
+uv run ruff format
+uv run ruff check
+```
 
-2. **Remove the git tracking test**: Delete the "Check files not tracked in git" step from `.github/workflows/tests.yml` since you'll now want this file to be tracked. These are just there for development purposes in the template repo itself.
+## Frontend
 
-3. **Add your own repository secrets**: You must [add secrets](https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-what-your-workflow-does/using-secrets-in-github-actions) for `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` so that the tests can run in CI.
+This agent works with any LiveKit frontend. The API server's `/getToken` endpoint is designed for the React starter:
 
-## Deploying to production
+- Web: [`livekit-examples/agent-starter-react`](https://github.com/livekit-examples/agent-starter-react)
 
-This project is production-ready and includes a working `Dockerfile`. To deploy it to LiveKit Cloud or another environment, see the [deploying to production](https://docs.livekit.io/deploy/agents/) guide.
+See the [frontend guide](https://docs.livekit.io/frontends/) for other platforms.
 
-## Self-hosted LiveKit
+## Working with this project & LiveKit docs
 
-You can also self-host LiveKit instead of using LiveKit Cloud. See the [self-hosting](https://docs.livekit.io/transport/self-hosting/local/) guide for more information. If you choose to self-host, you'll need to also use [model plugins](https://docs.livekit.io/agents/models/#plugins) instead of LiveKit Inference and will need to remove the [LiveKit Cloud noise cancellation](https://docs.livekit.io/transport/media/noise-cancellation/) plugin.
+See [`AGENTS.md`](AGENTS.md) for project conventions and for using the LiveKit CLI (`lk docs`) and MCP server to browse the latest documentation.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
